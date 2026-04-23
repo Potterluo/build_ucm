@@ -1,9 +1,9 @@
 name: Build UCM Wheels
 
 on:
-  # PR 触发 - 当 PR 被创建或更新时
-  pull_request:
-    types: [opened, synchronize, reopened]
+  # Issue 触发 - 当 Issue 被创建或带有特定标签时
+  issues:
+    types: [opened, edited]
 
   # 手动触发 - 用于测试或重新构建
   workflow_dispatch:
@@ -33,20 +33,23 @@ env:
 
 permissions:
   contents: write      # 创建 releases 和 tags
-  pull-requests: write # 评论 PR
+  issues: write        # 评论 issue
   actions: read        # 读取 actions
 
 jobs:
-  # 解析 PR 配置参数
+  # 解析配置参数
   parse-config:
     runs-on: ubuntu-latest
+    # Issue 触发时，检查是否包含构建请求
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.issue.body, 'build_config:')
     outputs:
       ucm_ref: ${{ steps.parse.outputs.ucm_ref }}
       python_version: ${{ steps.parse.outputs.python_version }}
       upload_to_release: ${{ steps.parse.outputs.upload_to_release }}
+      issue_number: ${{ steps.parse.outputs.issue_number }}
 
     steps:
-      - name: Parse configuration from PR
+      - name: Parse configuration
         id: parse
         run: |
           # workflow_dispatch 直接使用输入参数
@@ -54,46 +57,46 @@ jobs:
             echo "ucm_ref=${{ inputs.ucm_ref }}" >> $GITHUB_OUTPUT
             echo "python_version=${{ inputs.python_version }}" >> $GITHUB_OUTPUT
             echo "upload_to_release=${{ inputs.upload_to_release }}" >> $GITHUB_OUTPUT
+            echo "issue_number=0" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # PR 触发 - 从 PR body 解析配置
-          PR_BODY="${{ github.event.pull_request.body }}"
+          # Issue 触发 - 从 Issue body 解析配置
+          ISSUE_BODY="${{ github.event.issue.body }}"
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+
+          echo "Parsing Issue #${ISSUE_NUMBER}..."
+          echo "Issue body:"
+          echo "$ISSUE_BODY"
 
           # 默认值
           UCM_REF="main"
           PYTHON_VERSION="3.11"
           UPLOAD_RELEASE="true"
 
-          # 解析 YAML 配置块（如果存在）
-          # 格式：在 PR body 中添加如下配置块：
-          # ```
+          # 解析 YAML 配置块
+          # 格式示例：
           # build_config:
-          #   ucm_ref: v0.5.0
+          #   ucm_ref: develop
           #   python_version: 3.12
           #   upload_to_release: true
-          # ```
 
-          if echo "$PR_BODY" | grep -q "ucm_ref:"; then
-            UCM_REF=$(echo "$PR_BODY" | grep "ucm_ref:" | head -1 | sed 's/ucm_ref:\s*//' | tr -d '[:space:]')
-          fi
+          # 提取配置值
+          UCM_REF=$(echo "$ISSUE_BODY" | grep -E "^  ucm_ref:" | sed 's/^  ucm_ref: *//' | tr -d '[:space:]' || echo "main")
+          PYTHON_VERSION=$(echo "$ISSUE_BODY" | grep -E "^  python_version:" | sed 's/^  python_version: *//' | tr -d '[:space:]' || echo "3.11")
+          UPLOAD_RELEASE=$(echo "$ISSUE_BODY" | grep -E "^  upload_to_release:" | sed 's/^  upload_to_release: *//' | tr -d '[:space:]' || echo "true")
 
-          if echo "$PR_BODY" | grep -q "python_version:"; then
-            PYTHON_VERSION=$(echo "$PR_BODY" | grep "python_version:" | head -1 | sed 's/python_version:\s*//' | tr -d '[:space:]')
-          fi
-
-          if echo "$PR_BODY" | grep -q "upload_to_release:"; then
-            UPLOAD_RELEASE=$(echo "$PR_BODY" | grep "upload_to_release:" | head -1 | sed 's/upload_to_release:\s*//' | tr -d '[:space:]')
-          fi
-
+          echo ""
           echo "Parsed configuration:"
           echo "  UCM Ref: $UCM_REF"
           echo "  Python Version: $PYTHON_VERSION"
           echo "  Upload to Release: $UPLOAD_RELEASE"
+          echo "  Issue Number: $ISSUE_NUMBER"
 
           echo "ucm_ref=$UCM_REF" >> $GITHUB_OUTPUT
           echo "python_version=$PYTHON_VERSION" >> $GITHUB_OUTPUT
           echo "upload_to_release=$UPLOAD_RELEASE" >> $GITHUB_OUTPUT
+          echo "issue_number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
 
   # 构建 wheel 包 - 多架构矩阵
   build-wheels:
@@ -107,7 +110,7 @@ jobs:
           - runner: ubuntu-latest
             arch: x86_64
             platform: linux/amd64
-          - runner: ubuntu-24.04-arm  # GitHub ARM64 runner
+          - runner: ubuntu-24.04-arm
             arch: aarch64
             platform: linux/arm64
 
@@ -132,56 +135,20 @@ jobs:
           echo "UCM commit: $(git rev-parse HEAD)"
           echo "UCM branch/tag: $(git describe --tags --always)"
 
-      - name: Set build environment
-        run: |
-          cd ucm
-          # 设置构建环境变量
-          export PLATFORM="simu"
-
-          # ARM64 QEMU 稳定性优化（如果使用 QEMU）
-          if [ "${{ matrix.arch }}" == "aarch64" ] && [ "${{ matrix.runner }}" != "ubuntu-24.04-arm" ]; then
-            export CFLAGS="-O1 -fno-lto"
-            export CXXFLAGS="-O1 -fno-lto"
-            export LDFLAGS="-fno-lto"
-            # 减少并行编译
-            sed -i 's/-j[0-9]/-j1/g' setup.py || true
-          fi
-
-          echo "Architecture: ${{ matrix.arch }}"
-          echo "Runner: ${{ matrix.runner }}"
-
-      - name: Clean previous build
-        run: |
-          cd ucm
-          rm -rf build dist *.egg-info
-
       - name: Build wheel
         run: |
           cd ucm
+          export PLATFORM="simu"
+          rm -rf build dist *.egg-info
           python -m build --wheel --no-isolation
 
       - name: List built wheels
         run: |
           cd ucm
           ls -la dist/
-          echo "Wheel files:"
           for f in dist/*.whl; do
             echo "  $(basename $f)"
-            # 验证架构
-            unzip -l "$f" | grep ".so" | head -3
           done
-
-      - name: Rename wheel with architecture
-        run: |
-          cd ucm
-          for f in dist/*.whl; do
-            base=$(basename "$f")
-            # 重命名以包含架构信息（如果 wheel 名称中没有）
-            if ! echo "$base" | grep -q "${{ matrix.arch }}"; then
-              mv "$f" "dist/${base%%.whl}-${{ matrix.arch }}.whl"
-            fi
-          done
-          ls -la dist/
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
@@ -218,26 +185,9 @@ jobs:
 
       - name: Install and verify wheel
         run: |
-          echo "Installing wheel..."
           pip install wheels/*.whl
-
-          echo "Verifying installation..."
-          python -c "import ucm; print('UCM imported successfully')"
-          python -c "import ucm; print(f'Location: {ucm.__file__}')"
-
-          echo "Checking native libraries..."
-          python -c "
-          import ucm, os
-          ucm_path = os.path.dirname(ucm.__file__)
-          so_files = []
-          for root, dirs, files in os.walk(ucm_path):
-              for f in files:
-                  if f.endswith('.so'):
-                      so_files.append(f)
-          print(f'Native libraries: {len(so_files)} .so files')
-          for f in so_files[:10]:
-              print(f'  - {f}')
-          "
+          python -c "import ucm; print('✅ UCM imported successfully')"
+          python -c "import ucm, os; print(f'Location: {ucm.__file__}')"
 
       - name: Platform info
         run: |
@@ -249,6 +199,10 @@ jobs:
     needs: [parse-config, build-wheels, verify-wheels]
     runs-on: ubuntu-latest
     if: needs.parse-config.outputs.upload_to_release == 'true'
+
+    outputs:
+      release_tag: ${{ steps.tag.outputs.release_tag }}
+      release_url: ${{ steps.tag.outputs.release_url }}
 
     steps:
       - name: Checkout build_ucm repo
@@ -262,9 +216,7 @@ jobs:
           merge-multiple: true
 
       - name: List all wheels
-        run: |
-          echo "All built wheels:"
-          ls -la wheels/
+        run: ls -la wheels/
 
       - name: Generate release tag
         id: tag
@@ -272,13 +224,10 @@ jobs:
           UCM_REF="${{ needs.parse-config.outputs.ucm_ref }}"
           PY_VER="${{ needs.parse-config.outputs.python_version }}"
           TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-
-          # 清理 UCM_REF 中的特殊字符
           CLEAN_REF=$(echo "$UCM_REF" | sed 's/[^a-zA-Z0-9._-]/-/g')
-
           RELEASE_TAG="ucm-${CLEAN_REF}-py${PY_VER}-${TIMESTAMP}"
           echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
-          echo "Release tag: $RELEASE_TAG"
+          echo "release_url=https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}" >> $GITHUB_OUTPUT
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -294,65 +243,74 @@ jobs:
 
             **Python Version:** ${{ needs.parse-config.outputs.python_version }}
 
-            **Build Date:** ${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at }}
-
-            **Triggered by:** ${{ github.event_name }} - ${{ github.event.pull_request.title || 'Manual dispatch' }}
-
-            ### Built Wheels
-
-            | Architecture | Wheel File |
-            |-------------|------------|
-            | x86_64 | See artifacts below |
-            | aarch64 (ARM64) | See artifacts below |
+            **Triggered by:** ${{ github.event_name }}
 
             ### Installation
 
             ```bash
-            # Download the appropriate wheel for your platform
-            pip install uc_manager-*-py${{ needs.parse-config.outputs.python_version }}.whl
+            pip install uc_manager-*-cp${{ needs.parse-config.outputs.python_version }}*.whl
             ```
 
-            ### Verification
-
-            All wheels have been verified to install correctly on their target platforms.
+            All wheels have been verified to install correctly.
           files: wheels/*.whl
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # 更新 PR 状态（如果是 PR 触发）
-  update-pr:
+  # 评论 Issue 报告构建结果
+  report-result:
     needs: [parse-config, build-wheels, verify-wheels, create-release]
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: needs.parse-config.outputs.issue_number != '0'
 
     steps:
-      - name: Comment on PR
+      - name: Comment on Issue
         uses: actions/github-script@v7
         with:
           script: |
-            const releaseTag = '${{ needs.create-release.outputs.release_tag || '' }}';
+            const issueNumber = parseInt('${{ needs.parse-config.outputs.issue_number }}');
             const ucmRef = '${{ needs.parse-config.outputs.ucm_ref }}';
             const pyVersion = '${{ needs.parse-config.outputs.python_version }}';
+            const releaseTag = '${{ needs.create-release.outputs.release_tag }}';
+            const releaseUrl = '${{ needs.create-release.outputs.release_url }}';
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
-            let body = `## UCM Wheel Build Completed ✅\n\n`;
-            body += `**UCM Ref:** ${ucmRef}\n`;
-            body += `**Python Version:** ${pyVersion}\n\n`;
-            body += `### Built Wheels\n`;
-            body += `- x86_64: wheel-x86_64-py${pyVersion}\n`;
-            body += `- aarch64: wheel-aarch64-py${pyVersion}\n\n`;
+            let body = `## ✅ UCM Wheel Build Completed\n\n`;
+            body += `| Parameter | Value |\n`;
+            body += `|-----------|-------|\n`;
+            body += `| UCM Ref | ${ucmRef} |\n`;
+            body += `| Python Version | ${pyVersion} |\n`;
+            body += `| x86_64 | ✅ Built & Verified |\n`;
+            body += `| ARM64 | ✅ Built & Verified |\n\n`;
 
             if (releaseTag) {
-              body += `### Release\n`;
-              body += `Wheels uploaded to release: [${releaseTag}](https://github.com/${{ github.repository }}/releases/tag/${releaseTag})\n`;
+              body += `### 📦 Download Wheels\n\n`;
+              body += `**Release:** [${releaseTag}](${releaseUrl})\n\n`;
+              body += `| Platform | Wheel |\n`;
+              body += `|----------|-------|\n`;
+              body += `| x86_64 | \`uc_manager-*-linux_x86_64.whl\` |\n`;
+              body += `| ARM64 | \`uc_manager-*-linux_aarch64.whl\` |\n`;
             }
 
-            body += `\n### Artifacts\n`;
-            body += `Download from: [Workflow Artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\n`;
+            body += `\n### 🔗 Links\n\n`;
+            body += `- [Workflow Run](${runUrl})\n`;
+            body += `- [UCM Repository](https://github.com/ModelEngine-Group/unified-cache-management)\n`;
 
-            github.rest.issues.createComment({
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number: issueNumber,
               body: body
+            });
+
+      - name: Close Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = parseInt('${{ needs.parse-config.outputs.issue_number }}');
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              state: 'closed'
             });
