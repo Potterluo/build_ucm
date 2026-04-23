@@ -1,0 +1,353 @@
+name: Build UCM Wheels
+
+on:
+  # PR 触发 - 当 PR 被创建或更新时
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+  # 手动触发 - 用于测试或重新构建
+  workflow_dispatch:
+    inputs:
+      ucm_ref:
+        description: 'UCM branch, tag or commit SHA'
+        required: true
+        default: 'main'
+        type: string
+      python_version:
+        description: 'Python version (e.g., 3.11, 3.12)'
+        required: true
+        default: '3.11'
+        type: choice
+        options:
+          - '3.11'
+          - '3.12'
+          - '3.13'
+      upload_to_release:
+        description: 'Upload wheels to GitHub Release'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  UCM_REPO: https://github.com/ModelEngine-Group/unified-cache-management.git
+
+jobs:
+  # 解析 PR 配置参数
+  parse-config:
+    runs-on: ubuntu-latest
+    outputs:
+      ucm_ref: ${{ steps.parse.outputs.ucm_ref }}
+      python_version: ${{ steps.parse.outputs.python_version }}
+      upload_to_release: ${{ steps.parse.outputs.upload_to_release }}
+
+    steps:
+      - name: Parse configuration from PR
+        id: parse
+        run: |
+          # workflow_dispatch 直接使用输入参数
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "ucm_ref=${{ inputs.ucm_ref }}" >> $GITHUB_OUTPUT
+            echo "python_version=${{ inputs.python_version }}" >> $GITHUB_OUTPUT
+            echo "upload_to_release=${{ inputs.upload_to_release }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # PR 触发 - 从 PR body 解析配置
+          PR_BODY="${{ github.event.pull_request.body }}"
+
+          # 默认值
+          UCM_REF="main"
+          PYTHON_VERSION="3.11"
+          UPLOAD_RELEASE="true"
+
+          # 解析 YAML 配置块（如果存在）
+          # 格式：在 PR body 中添加如下配置块：
+          # ```
+          # build_config:
+          #   ucm_ref: v0.5.0
+          #   python_version: 3.12
+          #   upload_to_release: true
+          # ```
+
+          if echo "$PR_BODY" | grep -q "ucm_ref:"; then
+            UCM_REF=$(echo "$PR_BODY" | grep "ucm_ref:" | head -1 | sed 's/ucm_ref:\s*//' | tr -d '[:space:]')
+          fi
+
+          if echo "$PR_BODY" | grep -q "python_version:"; then
+            PYTHON_VERSION=$(echo "$PR_BODY" | grep "python_version:" | head -1 | sed 's/python_version:\s*//' | tr -d '[:space:]')
+          fi
+
+          if echo "$PR_BODY" | grep -q "upload_to_release:"; then
+            UPLOAD_RELEASE=$(echo "$PR_BODY" | grep "upload_to_release:" | head -1 | sed 's/upload_to_release:\s*//' | tr -d '[:space:]')
+          fi
+
+          echo "Parsed configuration:"
+          echo "  UCM Ref: $UCM_REF"
+          echo "  Python Version: $PYTHON_VERSION"
+          echo "  Upload to Release: $UPLOAD_RELEASE"
+
+          echo "ucm_ref=$UCM_REF" >> $GITHUB_OUTPUT
+          echo "python_version=$PYTHON_VERSION" >> $GITHUB_OUTPUT
+          echo "upload_to_release=$UPLOAD_RELEASE" >> $GITHUB_OUTPUT
+
+  # 构建 wheel 包 - 多架构矩阵
+  build-wheels:
+    needs: parse-config
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm  # GitHub ARM64 runner
+            arch: aarch64
+            platform: linux/arm64
+
+    steps:
+      - name: Checkout build_ucm repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ needs.parse-config.outputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.parse-config.outputs.python_version }}
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build wheel setuptools cmake ninja
+
+      - name: Clone UCM repository
+        run: |
+          git clone --depth 1 --branch ${{ needs.parse-config.outputs.ucm_ref }} $UCM_REPO ucm
+          cd ucm
+          echo "UCM commit: $(git rev-parse HEAD)"
+          echo "UCM branch/tag: $(git describe --tags --always)"
+
+      - name: Set build environment
+        run: |
+          cd ucm
+          # 设置构建环境变量
+          export PLATFORM="simu"
+
+          # ARM64 QEMU 稳定性优化（如果使用 QEMU）
+          if [ "${{ matrix.arch }}" == "aarch64" ] && [ "${{ matrix.runner }}" != "ubuntu-24.04-arm" ]; then
+            export CFLAGS="-O1 -fno-lto"
+            export CXXFLAGS="-O1 -fno-lto"
+            export LDFLAGS="-fno-lto"
+            # 减少并行编译
+            sed -i 's/-j[0-9]/-j1/g' setup.py || true
+          fi
+
+          echo "Architecture: ${{ matrix.arch }}"
+          echo "Runner: ${{ matrix.runner }}"
+
+      - name: Clean previous build
+        run: |
+          cd ucm
+          rm -rf build dist *.egg-info
+
+      - name: Build wheel
+        run: |
+          cd ucm
+          python -m build --wheel --no-isolation
+
+      - name: List built wheels
+        run: |
+          cd ucm
+          ls -la dist/
+          echo "Wheel files:"
+          for f in dist/*.whl; do
+            echo "  $(basename $f)"
+            # 验证架构
+            unzip -l "$f" | grep ".so" | head -3
+          done
+
+      - name: Rename wheel with architecture
+        run: |
+          cd ucm
+          for f in dist/*.whl; do
+            base=$(basename "$f")
+            # 重命名以包含架构信息（如果 wheel 名称中没有）
+            if ! echo "$base" | grep -q "${{ matrix.arch }}"; then
+              mv "$f" "dist/${base%%.whl}-${{ matrix.arch }}.whl"
+            fi
+          done
+          ls -la dist/
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.arch }}-py${{ needs.parse-config.outputs.python_version }}
+          path: ucm/dist/*.whl
+          retention-days: 30
+
+  # 验证 wheel 安装
+  verify-wheels:
+    needs: [parse-config, build-wheels]
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.arch }}-py${{ needs.parse-config.outputs.python_version }}
+          path: wheels
+
+      - name: Setup Python ${{ needs.parse-config.outputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.parse-config.outputs.python_version }}
+
+      - name: Install and verify wheel
+        run: |
+          echo "Installing wheel..."
+          pip install wheels/*.whl
+
+          echo "Verifying installation..."
+          python -c "import ucm; print('UCM imported successfully')"
+          python -c "import ucm; print(f'Location: {ucm.__file__}')"
+
+          echo "Checking native libraries..."
+          python -c "
+          import ucm, os
+          ucm_path = os.path.dirname(ucm.__file__)
+          so_files = []
+          for root, dirs, files in os.walk(ucm_path):
+              for f in files:
+                  if f.endswith('.so'):
+                      so_files.append(f)
+          print(f'Native libraries: {len(so_files)} .so files')
+          for f in so_files[:10]:
+              print(f'  - {f}')
+          "
+
+      - name: Platform info
+        run: |
+          echo "Platform: $(uname -m)"
+          echo "Python: $(python --version)"
+
+  # 创建 Release 并上传 wheel
+  create-release:
+    needs: [parse-config, build-wheels, verify-wheels]
+    runs-on: ubuntu-latest
+    if: needs.parse-config.outputs.upload_to_release == 'true'
+
+    steps:
+      - name: Checkout build_ucm repo
+        uses: actions/checkout@v4
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*-py${{ needs.parse-config.outputs.python_version }}
+          path: wheels
+          merge-multiple: true
+
+      - name: List all wheels
+        run: |
+          echo "All built wheels:"
+          ls -la wheels/
+
+      - name: Generate release tag
+        id: tag
+        run: |
+          UCM_REF="${{ needs.parse-config.outputs.ucm_ref }}"
+          PY_VER="${{ needs.parse-config.outputs.python_version }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+          # 清理 UCM_REF 中的特殊字符
+          CLEAN_REF=$(echo "$UCM_REF" | sed 's/[^a-zA-Z0-9._-]/-/g')
+
+          RELEASE_TAG="ucm-${CLEAN_REF}-py${PY_VER}-${TIMESTAMP}"
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "Release tag: $RELEASE_TAG"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          name: UCM Wheels - ${{ needs.parse-config.outputs.ucm_ref }} (Python ${{ needs.parse-config.outputs.python_version }})
+          body: |
+            ## UCM Wheel Build
+
+            **UCM Repository:** https://github.com/ModelEngine-Group/unified-cache-management
+
+            **UCM Ref:** ${{ needs.parse-config.outputs.ucm_ref }}
+
+            **Python Version:** ${{ needs.parse-config.outputs.python_version }}
+
+            **Build Date:** ${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at }}
+
+            **Triggered by:** ${{ github.event_name }} - ${{ github.event.pull_request.title || 'Manual dispatch' }}
+
+            ### Built Wheels
+
+            | Architecture | Wheel File |
+            |-------------|------------|
+            | x86_64 | See artifacts below |
+            | aarch64 (ARM64) | See artifacts below |
+
+            ### Installation
+
+            ```bash
+            # Download the appropriate wheel for your platform
+            pip install uc_manager-*-py${{ needs.parse-config.outputs.python_version }}.whl
+            ```
+
+            ### Verification
+
+            All wheels have been verified to install correctly on their target platforms.
+          files: wheels/*.whl
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 更新 PR 状态（如果是 PR 触发）
+  update-pr:
+    needs: [parse-config, build-wheels, verify-wheels, create-release]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const releaseTag = '${{ needs.create-release.outputs.release_tag || '' }}';
+            const ucmRef = '${{ needs.parse-config.outputs.ucm_ref }}';
+            const pyVersion = '${{ needs.parse-config.outputs.python_version }}';
+
+            let body = `## UCM Wheel Build Completed ✅\n\n`;
+            body += `**UCM Ref:** ${ucmRef}\n`;
+            body += `**Python Version:** ${pyVersion}\n\n`;
+            body += `### Built Wheels\n`;
+            body += `- x86_64: wheel-x86_64-py${pyVersion}\n`;
+            body += `- aarch64: wheel-aarch64-py${pyVersion}\n\n`;
+
+            if (releaseTag) {
+              body += `### Release\n`;
+              body += `Wheels uploaded to release: [${releaseTag}](https://github.com/${{ github.repository }}/releases/tag/${releaseTag})\n`;
+            }
+
+            body += `\n### Artifacts\n`;
+            body += `Download from: [Workflow Artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\n`;
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
