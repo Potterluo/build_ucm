@@ -149,4 +149,4 @@ GitHub ARM64 Runner (`ubuntu-24.04-arm`) 需要在仓库设置中启用：
 ## 相关链接
 
 - [UCM 仓库](https://github.com/ModelEngine-Group/unified-cache-management)
-- [跨平台编译指南](../.claude/skills/cross-compile-wheel.md)
+- [跨平台编译指南](../.claude/skills/cross-compile-wheel.md)Test PR for develop branch + Python 3.12
