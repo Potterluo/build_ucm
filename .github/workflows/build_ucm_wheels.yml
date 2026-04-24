@@ -55,7 +55,6 @@ jobs:
           python3 << 'PYEOF'
           import os
           import re
-          import sys
 
           event_name = os.environ.get('GITHUB_EVENT_NAME', '')
 
@@ -80,17 +79,36 @@ jobs:
               upload_to_release = 'true'
 
               # 解析 build_config YAML 块
-              # 匹配格式: build_config:\n  ucm_ref: xxx\n  python_version: xxx
-              config_match = re.search(
-                  r'build_config:\s*\n\s*ucm_ref:\s*(\S+)\s*\n\s*python_version:\s*["\']?(\d+\.\d+)["\']?\s*\n\s*upload_to_release:\s*(\w+)',
+              # 先找到 build_config: 块，然后逐行解析配置项（跳过注释行）
+              config_block_match = re.search(
+                  r'build_config:\s*\n(.*?)(?:\n```|\n---|\n\*{3,}|\Z)',
                   issue_body,
-                  re.MULTILINE
+                  re.DOTALL
               )
 
-              if config_match:
-                  ucm_ref = config_match.group(1).strip()
-                  python_version = config_match.group(2).strip()
-                  upload_to_release = config_match.group(3).strip().lower()
+              if config_block_match:
+                  config_block = config_block_match.group(1)
+                  # 逐行解析，跳过注释和空行
+                  for line in config_block.split('\n'):
+                      line = line.strip()
+                      # 跳过注释行和空行
+                      if not line or line.startswith('#'):
+                          continue
+
+                      # 解析 ucm_ref
+                      if line.startswith('ucm_ref:'):
+                          ucm_ref = line.split(':', 1)[1].strip()
+
+                      # 解析 python_version
+                      elif line.startswith('python_version:'):
+                          py_val = line.split(':', 1)[1].strip()
+                          # 移除引号
+                          py_val = re.sub(r'^["\']|["\']$', '', py_val)
+                          python_version = py_val
+
+                      # 解析 upload_to_release
+                      elif line.startswith('upload_to_release:'):
+                          upload_to_release = line.split(':', 1)[1].strip().lower()
 
               print(f"Parsing Issue #{issue_number}...")
               print(f"  UCM Ref: {ucm_ref}")
