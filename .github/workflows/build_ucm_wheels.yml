@@ -290,7 +290,8 @@ jobs:
   report-result:
     needs: [parse-config, build-wheels, verify-wheels, create-release]
     runs-on: ubuntu-latest
-    if: needs.parse-config.outputs.issue_number != '0'
+    # 即使 create-release 被跳过也要运行
+    if: always() && needs.parse-config.outputs.issue_number != '0' && needs.build-wheels.result == 'success' && needs.verify-wheels.result == 'success'
 
     steps:
       - name: Comment on Issue
@@ -312,13 +313,21 @@ jobs:
             body += `| x86_64 | ✅ Built & Verified |\n`;
             body += `| ARM64 | ✅ Built & Verified |\n\n`;
 
-            if (releaseTag) {
+            if (releaseTag && releaseUrl) {
               body += `### 📦 Download Wheels\n\n`;
               body += `**Release:** [${releaseTag}](${releaseUrl})\n\n`;
               body += `| Platform | Wheel |\n`;
               body += `|----------|-------|\n`;
               body += `| x86_64 | \`uc_manager-*-linux_x86_64.whl\` |\n`;
               body += `| ARM64 | \`uc_manager-*-linux_aarch64.whl\` |\n`;
+            } else {
+              body += `### 📦 Download Wheels\n\n`;
+              body += `**Artifacts:** [Download from Workflow Run](${runUrl})\n\n`;
+              body += ` Wheels are stored in Artifacts (保留30天)\n`;
+              body += `| Platform | Artifact Name |\n`;
+              body += `|----------|---------------|\n`;
+              body += `| x86_64 | \`wheel-x86_64-py${pyVersion}\` |\n`;
+              body += `| ARM64 | \`wheel-aarch64-py${pyVersion}\` |\n`;
             }
 
             body += `\n### 🔗 Links\n\n`;
