@@ -1,6 +1,6 @@
 ---
 name: cross-compile-wheel
-description: 跨平台编译 Python wheel 包的完整指南。涵盖 Docker QEMU 模拟、GitHub Actions CI/CD、Issue 触发自动化构建等多种方案。适用于需要构建多架构（x86_64/ARM64）或多 Python 版本 wheel 包的场景。当用户提及：构建 ARM64 wheel、跨平台编译 Python 包、为不同架构打包 Python 项目、编译 pybind11/CMake 扩展、多架构 wheel 构建、Python wheel 交叉编译、GitHub Actions 自动构建 wheel、Issue 触发构建时自动触发此 skill。
+description: 跨平台编译 Python wheel 包的完整指南。涵盖 Docker QEMU 模拟、GitHub Actions CI/CD、Issue 触发自动化构建、GPU/NPU 平台（CUDA/Ascend）构建等多种方案。适用于需要构建多架构（x86_64/ARM64）或多 Python 版本 wheel 包的场景。当用户提及：构建 ARM64 wheel、跨平台编译 Python 包、为不同架构打包 Python 项目、编译 pybind11/CMake 扩展、多架构 wheel 构建、Python wheel 交叉编译、GitHub Actions 自动构建 wheel、Issue 触发构建、CUDA wheel 构建、Ascend NPU 构建、GPU 依赖编译时自动触发此 skill。
 ---
 
 # Python Wheel 跨平台编译指南
@@ -10,6 +10,7 @@ description: 跨平台编译 Python wheel 包的完整指南。涵盖 Docker QEM
 - 在 x86_64 主机上构建 ARM64 (aarch64) wheel 包
 - 为多个 Python 版本（3.11/3.12/3.13）构建 wheel
 - 包含 C++/CMake/pybind11 扩展的 Python 项目
+- **GPU/NPU 平台构建**：CUDA (NVIDIA)、Ascend (华为昇腾)
 - Docker 容器化构建流程
 - GitHub Actions CI/CD 自动构建
 - Issue 触发的自动化构建流程
@@ -23,6 +24,8 @@ description: 跨平台编译 Python wheel 包的完整指南。涵盖 Docker QEM
 | **Docker QEMU 模拟** | 本地测试、单次构建 | ★★☆☆☆ | ★★★☆☆ | 手动 |
 | **GitHub Actions Runner** | CI/CD 简单构建 | ★★★★★ | ★★★★★ | 半自动 |
 | **Issue 触发完整流程** | 团队协作、自动化归档 | ★★★★★ | ★★★★★ | 全自动 |
+| **CUDA 容器构建** | NVIDIA GPU 项目 | ★★★★★ | ★★★★★ | 半自动 |
+| **Ascend ARM64 构建** | 华为昇腾 NPU 项目 | ★★★★☆ | ★★★★☆ | 半自动 |
 | **云服务器原生构建** | 大规模生产构建 | ★★★★★ | ★★★★★ | 手动 |
 
 ---
@@ -493,6 +496,131 @@ Issue 创建 → 解析配置 → 并行构建(x86+ARM) → 验证安装 → 创
 | `target_ref` | 目标分支/tag/commit | `main` |
 | `python_version` | Python 版本 | `3.11` |
 | `upload_to_release` | 上传到 Release | `true` |
+
+---
+
+## 方案四：GPU/NPU 平台构建
+
+### 平台差异说明
+
+| Platform | 架构 | 运行时依赖 | 适用场景 |
+|----------|------|-----------|----------|
+| `simu` | x86 + ARM | 无 | 纯 CPU 模式，测试用 |
+| `cuda` | x86_64 | CUDA Toolkit 12.x | NVIDIA GPU 环境 |
+| `ascend` | ARM64 | CANN + torch_npu | 华为昇腾 NPU 环境 |
+
+### CUDA 构建（NVIDIA GPU）
+
+#### 本地 Docker 构建
+
+```bash
+# 使用 NVIDIA CUDA 容器
+docker run --rm --gpus all \
+    -v $(pwd):/workspace \
+    nvidia/cuda:12.4-devel-ubuntu22.04 \
+    bash -c "
+        apt update && apt install -y python3.12-dev python3-pip
+        pip install build wheel setuptools cmake ninja pybind11
+        cd /workspace
+        export PLATFORM=cuda
+        export CUDA_HOME=/usr/local/cuda
+        python3.12 -m build --wheel --no-isolation
+    "
+```
+
+#### GitHub Actions CUDA 构建
+
+```yaml
+build-cuda:
+  runs-on: ubuntu-latest
+  container:
+    image: nvidia/cuda:12.4-devel-ubuntu22.04
+  steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Python and build tools
+      run: |
+        apt-get update
+        apt-get install -y python3.12 python3.12-dev python3-pip
+        python3.12 -m pip install build wheel setuptools cmake ninja
+
+    - name: Build wheel
+      env:
+        PLATFORM: cuda
+        CUDA_HOME: /usr/local/cuda
+      run: |
+        python3.12 -m build --wheel --no-isolation
+
+    - name: Upload wheel
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheel-cuda-x86_64
+        path: dist/*.whl
+```
+
+### Ascend 构建（华为昇腾 NPU）
+
+#### 环境要求
+
+- **架构**：ARM64 (aarch64)
+- **CANN Toolkit**：华为 Ascend Compute Architecture
+- **torch_npu**：PyTorch NPU 扩展
+
+#### 本地构建（需预配置环境）
+
+```bash
+# 在 ARM64 + CANN 环境中
+export PLATFORM=ascend
+export ASCEND_ROOT=/usr/local/Ascend/ascend-toolkit/latest
+
+# 构建 wheel
+python3.12 -m build --wheel --no-isolation
+
+# 构建产物
+# - uc_manager-*.whl (主 wheel)
+# - UCM-custom_ops-*.run (自定义算子安装器)
+# - ucm_custom_ops-*.whl (自定义算子 wheel)
+```
+
+#### GitHub Actions Ascend 构建
+
+```yaml
+build-ascend:
+  runs-on: ubuntu-24.04-arm  # ARM64 runner
+  steps:
+    - uses: actions/checkout@v4
+
+    - name: Check CANN environment
+      run: |
+        if [ -d "/usr/local/Ascend/ascend-toolkit" ]; then
+          echo "CANN found"
+        else
+          echo "⚠️ Fallback to simu mode"
+        fi
+
+    - name: Build wheel
+      env:
+        PLATFORM: ascend
+      run: |
+        if [ -d "/usr/local/Ascend/ascend-toolkit" ]; then
+          export PLATFORM=ascend
+          export ASCEND_ROOT=/usr/local/Ascend/ascend-toolkit/latest
+        else
+          export PLATFORM=simu  # Fallback
+        fi
+        python -m build --wheel --no-isolation
+```
+
+### 平台环境变量对照表
+
+| PLATFORM | CMake RUNTIME_ENVIRONMENT | 编译产物 |
+|----------|--------------------------|---------|
+| `cuda` | `-DRUNTIME_ENVIRONMENT=cuda` | CUDA .so 内入 wheel |
+| `ascend` | `-DRUNTIME_ENVIRONMENT=ascend` | wheel + custom_ops |
+| `ascend-a3` | `-DRUNTIME_ENVIRONMENT=ascend` | A3 特定优化 |
+| `musa` | `-DRUNTIME_ENVIRONMENT=musa` | MooreThreads GPU |
+| `maca` | `-DRUNTIME_ENVIRONMENT=maca` | Cambricon MLU |
+| `simu` (默认) | `-DRUNTIME_ENVIRONMENT=simu` | 无 GPU/NPU 内核 |
 
 ---
 
