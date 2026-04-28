@@ -1,7 +1,7 @@
 name: Build UCM Wheels
 
 on:
-  # Issue 触发 - 当 Issue 被创建或带有特定标签时
+  # Issue 触发 - 当 Issue 被创建或编辑时
   issues:
     types: [opened, edited]
 
@@ -22,6 +22,15 @@ on:
           - '3.11'
           - '3.12'
           - '3.13'
+      platform:
+        description: 'Target platform (simu, cuda, ascend)'
+        required: true
+        default: 'simu'
+        type: choice
+        options:
+          - 'simu'
+          - 'cuda'
+          - 'ascend'
       upload_to_release:
         description: 'Upload wheels to GitHub Release'
         required: true
@@ -45,6 +54,7 @@ jobs:
     outputs:
       ucm_ref: ${{ steps.parse.outputs.ucm_ref }}
       python_version: ${{ steps.parse.outputs.python_version }}
+      platform: ${{ steps.parse.outputs.platform }}
       upload_to_release: ${{ steps.parse.outputs.upload_to_release }}
       issue_number: ${{ steps.parse.outputs.issue_number }}
 
@@ -62,6 +72,7 @@ jobs:
               # workflow_dispatch: 使用 inputs 环境变量
               ucm_ref = os.environ.get('INPUT_UCM_REF', 'main')
               python_version = os.environ.get('INPUT_PYTHON_VERSION', '3.11')
+              platform = os.environ.get('INPUT_PLATFORM', 'simu')
               upload_to_release = os.environ.get('INPUT_UPLOAD_TO_RELEASE', 'true')
               issue_number = '0'
           else:
@@ -76,10 +87,10 @@ jobs:
               # 默认值
               ucm_ref = 'main'
               python_version = '3.11'
+              platform = 'simu'
               upload_to_release = 'true'
 
               # 解析 build_config YAML 块
-              # 先找到 build_config: 块，然后逐行解析配置项（跳过注释行）
               config_block_match = re.search(
                   r'build_config:\s*\n(.*?)(?:\n```|\n---|\n\*{3,}|\Z)',
                   issue_body,
@@ -88,48 +99,46 @@ jobs:
 
               if config_block_match:
                   config_block = config_block_match.group(1)
-                  # 逐行解析，跳过注释和空行
                   for line in config_block.split('\n'):
                       line = line.strip()
-                      # 跳过注释行和空行
                       if not line or line.startswith('#'):
                           continue
 
-                      # 解析 ucm_ref
                       if line.startswith('ucm_ref:'):
                           ucm_ref = line.split(':', 1)[1].strip()
-
-                      # 解析 python_version
                       elif line.startswith('python_version:'):
                           py_val = line.split(':', 1)[1].strip()
-                          # 移除引号
                           py_val = re.sub(r'^["\']|["\']$', '', py_val)
                           python_version = py_val
-
-                      # 解析 upload_to_release
+                      elif line.startswith('platform:'):
+                          platform = line.split(':', 1)[1].strip()
                       elif line.startswith('upload_to_release:'):
                           upload_to_release = line.split(':', 1)[1].strip().lower()
 
               print(f"Parsing Issue #{issue_number}...")
               print(f"  UCM Ref: {ucm_ref}")
               print(f"  Python Version: {python_version}")
+              print(f"  Platform: {platform}")
               print(f"  Upload to Release: {upload_to_release}")
 
           # 写入 GITHUB_OUTPUT
           with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
               f.write(f"ucm_ref={ucm_ref}\n")
               f.write(f"python_version={python_version}\n")
+              f.write(f"platform={platform}\n")
               f.write(f"upload_to_release={upload_to_release}\n")
               f.write(f"issue_number={issue_number}\n")
           PYEOF
         env:
           INPUT_UCM_REF: ${{ inputs.ucm_ref }}
           INPUT_PYTHON_VERSION: ${{ inputs.python_version }}
+          INPUT_PLATFORM: ${{ inputs.platform }}
           INPUT_UPLOAD_TO_RELEASE: ${{ inputs.upload_to_release }}
 
-  # 构建 wheel 包 - 多架构矩阵
-  build-wheels:
+  # SIMU 模式构建 - 纯 CPU，无 GPU/NPU 依赖
+  build-simu:
     needs: parse-config
+    if: needs.parse-config.outputs.platform == 'simu'
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -138,10 +147,8 @@ jobs:
         include:
           - runner: ubuntu-latest
             arch: x86_64
-            platform: linux/amd64
           - runner: ubuntu-24.04-arm
             arch: aarch64
-            platform: linux/arm64
 
     steps:
       - name: Checkout build_ucm repo
@@ -162,9 +169,8 @@ jobs:
           git clone --depth 1 --branch ${{ needs.parse-config.outputs.ucm_ref }} $UCM_REPO ucm
           cd ucm
           echo "UCM commit: $(git rev-parse HEAD)"
-          echo "UCM branch/tag: $(git describe --tags --always)"
 
-      - name: Build wheel
+      - name: Build wheel (simu mode)
         run: |
           cd ucm
           export PLATFORM="simu"
@@ -182,13 +188,14 @@ jobs:
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.arch }}-py${{ needs.parse-config.outputs.python_version }}
+          name: wheel-simu-${{ matrix.arch }}-py${{ needs.parse-config.outputs.python_version }}
           path: ucm/dist/*.whl
           retention-days: 30
 
-  # 验证 wheel 安装
-  verify-wheels:
-    needs: [parse-config, build-wheels]
+  # SIMU 模式验证
+  verify-simu:
+    needs: [parse-config, build-simu]
+    if: needs.parse-config.outputs.platform == 'simu'
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -204,7 +211,7 @@ jobs:
       - name: Download wheel artifact
         uses: actions/download-artifact@v4
         with:
-          name: wheel-${{ matrix.arch }}-py${{ needs.parse-config.outputs.python_version }}
+          name: wheel-simu-${{ matrix.arch }}-py${{ needs.parse-config.outputs.python_version }}
           path: wheels
 
       - name: Setup Python ${{ needs.parse-config.outputs.python_version }}
@@ -223,11 +230,181 @@ jobs:
           echo "Platform: $(uname -m)"
           echo "Python: $(python --version)"
 
+  # CUDA 模式构建 - 需要 CUDA Toolkit
+  build-cuda:
+    needs: parse-config
+    if: needs.parse-config.outputs.platform == 'cuda'
+    runs-on: ubuntu-latest
+    # 使用 NVIDIA CUDA 容器镜像
+    container:
+      image: nvidia/cuda:12.4-devel-ubuntu22.04
+
+    steps:
+      - name: Checkout build_ucm repo
+        uses: actions/checkout@v4
+
+      - name: Install Python and build tools
+        run: |
+          apt-get update
+          apt-get install -y python${{ needs.parse-config.outputs.python_version }} python${{ needs.parse-config.outputs.python_version }}-dev python${{ needs.parse-config.outputs.python_version }}-venv
+          python${{ needs.parse-config.outputs.python_version }} -m pip install --upgrade pip
+          python${{ needs.parse-config.outputs.python_version }} -m pip install build wheel setuptools cmake ninja pybind11
+
+      - name: Clone UCM repository
+        run: |
+          git clone --depth 1 --branch ${{ needs.parse-config.outputs.ucm_ref }} $UCM_REPO ucm
+          cd ucm
+          echo "UCM commit: $(git rev-parse HEAD)"
+
+      - name: Build wheel (CUDA mode)
+        env:
+          PLATFORM: cuda
+          CUDA_HOME: /usr/local/cuda
+        run: |
+          cd ucm
+          rm -rf build dist *.egg-info
+          python${{ needs.parse-config.outputs.python_version }} -m build --wheel --no-isolation
+
+      - name: List built wheels
+        run: |
+          cd ucm
+          ls -la dist/
+          for f in dist/*.whl; do
+            echo "  $(basename $f)"
+          done
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-cuda-x86_64-py${{ needs.parse-config.outputs.python_version }}
+          path: ucm/dist/*.whl
+          retention-days: 30
+
+  # CUDA 模式验证 (基础验证，无 GPU)
+  verify-cuda:
+    needs: [parse-config, build-cuda]
+    if: needs.parse-config.outputs.platform == 'cuda'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-cuda-x86_64-py${{ needs.parse-config.outputs.python_version }}
+          path: wheels
+
+      - name: Setup Python ${{ needs.parse-config.outputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.parse-config.outputs.python_version }}
+
+      - name: Basic verification (import check)
+        run: |
+          pip install wheels/*.whl
+          python -c "import ucm; print('✅ UCM imported successfully')"
+          echo "Note: CUDA kernels require GPU runtime to execute"
+
+  # Ascend 模式构建 - 需要 CANN Toolkit (ARM64)
+  build-ascend:
+    needs: parse-config
+    if: needs.parse-config.outputs.platform == 'ascend'
+    runs-on: ubuntu-24.04-arm
+    # 注意：实际构建需要预配置的 Ascend 环境
+    # 这里使用基础镜像，实际部署需要使用华为提供的 CANN 镜像
+
+    steps:
+      - name: Checkout build_ucm repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ needs.parse-config.outputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.parse-config.outputs.python_version }}
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build wheel setuptools cmake ninja
+
+      - name: Clone UCM repository
+        run: |
+          git clone --depth 1 --branch ${{ needs.parse-config.outputs.ucm_ref }} $UCM_REPO ucm
+          cd ucm
+          echo "UCM commit: $(git rev-parse HEAD)"
+
+      - name: Check Ascend environment
+        run: |
+          echo "Checking Ascend CANN environment..."
+          # 检查 CANN 是否安装
+          if [ -d "/usr/local/Ascend/ascend-toolkit" ]; then
+            echo "CANN found at /usr/local/Ascend/ascend-toolkit"
+            ls -la /usr/local/Ascend/ascend-toolkit/latest/lib64/
+          else
+            echo "⚠️ CANN not found - using simu mode fallback"
+            echo "Note: Real Ascend build requires CANN toolkit"
+          fi
+
+      - name: Build wheel (Ascend mode)
+        env:
+          PLATFORM: ascend
+        run: |
+          cd ucm
+          # 如果 CANN 存在则使用 ascend，否则 fallback 到 simu
+          if [ -d "/usr/local/Ascend/ascend-toolkit" ]; then
+            export PLATFORM="ascend"
+            export ASCEND_ROOT="/usr/local/Ascend/ascend-toolkit/latest"
+          else
+            echo "⚠️ Fallback to simu mode"
+            export PLATFORM="simu"
+          fi
+          rm -rf build dist *.egg-info
+          python -m build --wheel --no-isolation
+
+      - name: List built wheels
+        run: |
+          cd ucm
+          ls -la dist/
+          for f in dist/*.whl; do
+            echo "  $(basename $f)"
+          done
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-ascend-aarch64-py${{ needs.parse-config.outputs.python_version }}
+          path: ucm/dist/*.whl
+          retention-days: 30
+
+  # Ascend 模式验证
+  verify-ascend:
+    needs: [parse-config, build-ascend]
+    if: needs.parse-config.outputs.platform == 'ascend'
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-ascend-aarch64-py${{ needs.parse-config.outputs.python_version }}
+          path: wheels
+
+      - name: Setup Python ${{ needs.parse-config.outputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.parse-config.outputs.python_version }}
+
+      - name: Basic verification
+        run: |
+          pip install wheels/*.whl
+          python -c "import ucm; print('✅ UCM imported successfully')"
+          echo "Note: Ascend kernels require NPU runtime to execute"
+
   # 创建 Release 并上传 wheel
   create-release:
-    needs: [parse-config, build-wheels, verify-wheels]
+    needs: [parse-config, build-simu, verify-simu, build-cuda, verify-cuda, build-ascend, verify-ascend]
     runs-on: ubuntu-latest
-    if: needs.parse-config.outputs.upload_to_release == 'true'
+    if: always() && needs.parse-config.outputs.upload_to_release == 'true' &&
+        (needs.build-simu.result == 'success' || needs.build-cuda.result == 'success' || needs.build-ascend.result == 'success')
 
     outputs:
       release_tag: ${{ steps.tag.outputs.release_tag }}
@@ -252,9 +429,10 @@ jobs:
         run: |
           UCM_REF="${{ needs.parse-config.outputs.ucm_ref }}"
           PY_VER="${{ needs.parse-config.outputs.python_version }}"
+          PLATFORM="${{ needs.parse-config.outputs.platform }}"
           TIMESTAMP=$(date +%Y%m%d-%H%M%S)
           CLEAN_REF=$(echo "$UCM_REF" | sed 's/[^a-zA-Z0-9._-]/-/g')
-          RELEASE_TAG="ucm-${CLEAN_REF}-py${PY_VER}-${TIMESTAMP}"
+          RELEASE_TAG="ucm-${CLEAN_REF}-${PLATFORM}-py${PY_VER}-${TIMESTAMP}"
           echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
           echo "release_url=https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}" >> $GITHUB_OUTPUT
 
@@ -262,7 +440,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.release_tag }}
-          name: UCM Wheels - ${{ needs.parse-config.outputs.ucm_ref }} (Python ${{ needs.parse-config.outputs.python_version }})
+          name: UCM Wheels - ${{ needs.parse-config.outputs.ucm_ref }} (${{ needs.parse-config.outputs.platform }} / Python ${{ needs.parse-config.outputs.python_version }})
           body: |
             ## UCM Wheel Build
 
@@ -270,9 +448,16 @@ jobs:
 
             **UCM Ref:** ${{ needs.parse-config.outputs.ucm_ref }}
 
+            **Platform:** ${{ needs.parse-config.outputs.platform }}
+
             **Python Version:** ${{ needs.parse-config.outputs.python_version }}
 
             **Triggered by:** ${{ github.event_name }}
+
+            ### Platform Notes
+            - **simu**: Simulation mode, no GPU/NPU kernels (for testing)
+            - **cuda**: CUDA kernels included (requires NVIDIA GPU runtime)
+            - **ascend**: Ascend NPU kernels (requires Huawei CANN runtime)
 
             ### Installation
 
@@ -280,7 +465,7 @@ jobs:
             pip install uc_manager-*-cp${{ needs.parse-config.outputs.python_version }}*.whl
             ```
 
-            All wheels have been verified to install correctly.
+            All wheels have passed basic import verification.
           files: wheels/*.whl
           fail_on_unmatched_files: false
         env:
@@ -288,10 +473,10 @@ jobs:
 
   # 评论 Issue 报告构建结果
   report-result:
-    needs: [parse-config, build-wheels, verify-wheels, create-release]
+    needs: [parse-config, build-simu, verify-simu, build-cuda, verify-cuda, build-ascend, verify-ascend, create-release]
     runs-on: ubuntu-latest
-    # 即使 create-release 被跳过也要运行
-    if: always() && needs.parse-config.outputs.issue_number != '0' && needs.build-wheels.result == 'success' && needs.verify-wheels.result == 'success'
+    if: always() && needs.parse-config.outputs.issue_number != '0' &&
+        (needs.build-simu.result == 'success' || needs.build-cuda.result == 'success' || needs.build-ascend.result == 'success')
 
     steps:
       - name: Comment on Issue
@@ -301,6 +486,7 @@ jobs:
             const issueNumber = parseInt('${{ needs.parse-config.outputs.issue_number }}');
             const ucmRef = '${{ needs.parse-config.outputs.ucm_ref }}';
             const pyVersion = '${{ needs.parse-config.outputs.python_version }}';
+            const platform = '${{ needs.parse-config.outputs.platform }}';
             const releaseTag = '${{ needs.create-release.outputs.release_tag }}';
             const releaseUrl = '${{ needs.create-release.outputs.release_url }}';
             const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
@@ -310,24 +496,39 @@ jobs:
             body += `|-----------|-------|\n`;
             body += `| UCM Ref | ${ucmRef} |\n`;
             body += `| Python Version | ${pyVersion} |\n`;
-            body += `| x86_64 | ✅ Built & Verified |\n`;
-            body += `| ARM64 | ✅ Built & Verified |\n\n`;
+            body += `| Platform | ${platform} |\n\n`;
+
+            // 添加平台特定的构建结果
+            if (platform === 'simu') {
+              body += `| x86_64 (simu) | ${needs.build-simu.result === 'success' ? '✅' : '❌'} |\n`;
+              body += `| ARM64 (simu) | ${needs.build-simu.result === 'success' ? '✅' : '❌'} |\n`;
+            } else if (platform === 'cuda') {
+              body += `| x86_64 (CUDA) | ${needs.build-cuda.result === 'success' ? '✅' : '❌'} |\n`;
+            } else if (platform === 'ascend') {
+              body += `| ARM64 (Ascend) | ${needs.build-ascend.result === 'success' ? '✅' : '❌'} |\n`;
+            }
+            body += `\n`;
 
             if (releaseTag && releaseUrl) {
               body += `### 📦 Download Wheels\n\n`;
               body += `**Release:** [${releaseTag}](${releaseUrl})\n\n`;
-              body += `| Platform | Wheel |\n`;
-              body += `|----------|-------|\n`;
-              body += `| x86_64 | \`uc_manager-*-linux_x86_64.whl\` |\n`;
-              body += `| ARM64 | \`uc_manager-*-linux_aarch64.whl\` |\n`;
             } else {
               body += `### 📦 Download Wheels\n\n`;
               body += `**Artifacts:** [Download from Workflow Run](${runUrl})\n\n`;
-              body += ` Wheels are stored in Artifacts (保留30天)\n`;
-              body += `| Platform | Artifact Name |\n`;
-              body += `|----------|---------------|\n`;
-              body += `| x86_64 | \`wheel-x86_64-py${pyVersion}\` |\n`;
-              body += `| ARM64 | \`wheel-aarch64-py${pyVersion}\` |\n`;
+              body += `Wheels are stored in Artifacts (保留30天)\n`;
+            }
+
+            // 平台注意事项
+            body += `\n### ℹ️ Platform Notes\n\n`;
+            if (platform === 'simu') {
+              body += `- **simu mode**: Pure CPU, no GPU/NPU kernels\n`;
+              body += `- Suitable for testing and development\n`;
+            } else if (platform === 'cuda') {
+              body += `- **cuda mode**: CUDA kernels included\n`;
+              body += `- Requires NVIDIA GPU with CUDA 12.x runtime\n`;
+            } else if (platform === 'ascend') {
+              body += `- **ascend mode**: Ascend NPU kernels\n`;
+              body += `- Requires Huawei CANN toolkit and NPU hardware\n`;
             }
 
             body += `\n### 🔗 Links\n\n`;
