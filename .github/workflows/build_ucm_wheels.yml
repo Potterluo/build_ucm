@@ -481,6 +481,10 @@ jobs:
     steps:
       - name: Comment on Issue
         uses: actions/github-script@v7
+        env:
+          BUILD_SIMU_RESULT: ${{ needs.build-simu.result }}
+          BUILD_CUDA_RESULT: ${{ needs.build-cuda.result }}
+          BUILD_ASCEND_RESULT: ${{ needs.build-ascend.result }}
         with:
           script: |
             const issueNumber = parseInt('${{ needs.parse-config.outputs.issue_number }}');
@@ -491,6 +495,11 @@ jobs:
             const releaseUrl = '${{ needs.create-release.outputs.release_url }}';
             const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
+            // 从环境变量获取构建结果
+            const buildSimuResult = process.env.BUILD_SIMU_RESULT;
+            const buildCudaResult = process.env.BUILD_CUDA_RESULT;
+            const buildAscendResult = process.env.BUILD_ASCEND_RESULT;
+
             let body = `## ✅ UCM Wheel Build Completed\n\n`;
             body += `| Parameter | Value |\n`;
             body += `|-----------|-------|\n`;
@@ -500,12 +509,12 @@ jobs:
 
             // 添加平台特定的构建结果
             if (platform === 'simu') {
-              body += `| x86_64 (simu) | ${needs.build-simu.result === 'success' ? '✅' : '❌'} |\n`;
-              body += `| ARM64 (simu) | ${needs.build-simu.result === 'success' ? '✅' : '❌'} |\n`;
+              body += `| x86_64 (simu) | ${buildSimuResult === 'success' ? '✅' : '❌'} |\n`;
+              body += `| ARM64 (simu) | ${buildSimuResult === 'success' ? '✅' : '❌'} |\n`;
             } else if (platform === 'cuda') {
-              body += `| x86_64 (CUDA) | ${needs.build-cuda.result === 'success' ? '✅' : '❌'} |\n`;
+              body += `| x86_64 (CUDA) | ${buildCudaResult === 'success' ? '✅' : '❌'} |\n`;
             } else if (platform === 'ascend') {
-              body += `| ARM64 (Ascend) | ${needs.build-ascend.result === 'success' ? '✅' : '❌'} |\n`;
+              body += `| ARM64 (Ascend) | ${buildAscendResult === 'success' ? '✅' : '❌'} |\n`;
             }
             body += `\n`;
 
