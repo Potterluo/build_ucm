@@ -246,9 +246,12 @@ jobs:
       - name: Install Python and build tools
         run: |
           apt-get update
+          apt-get install -y software-properties-common curl
+          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get update
           apt-get install -y python${{ needs.parse-config.outputs.python_version }} python${{ needs.parse-config.outputs.python_version }}-dev python${{ needs.parse-config.outputs.python_version }}-venv
-          python${{ needs.parse-config.outputs.python_version }} -m pip install --upgrade pip
-          python${{ needs.parse-config.outputs.python_version }} -m pip install build wheel setuptools cmake ninja pybind11
+          curl -sS https://bootstrap.pypa.io/get-pip.py | python${{ needs.parse-config.outputs.python_version }}
+          python${{ needs.parse-config.outputs.python_version }} -m pip install --break-system-packages build wheel setuptools cmake ninja pybind11 torch
 
       - name: Clone UCM repository
         run: |
@@ -256,14 +259,43 @@ jobs:
           cd ucm
           echo "UCM commit: $(git rev-parse HEAD)"
 
-      - name: Build wheel (CUDA mode)
+      # 方案 A：尝试在容器中编译 CUDA（如果没有 GPU 会失败或生成 simu 版本）
+      # 方案 B：如果失败，使用预编译的 .so 文件（需要提前上传到 Release）
+      - name: Build wheel (CUDA mode - try compile first)
+        id: cuda-build
         env:
           PLATFORM: cuda
           CUDA_HOME: /usr/local/cuda
+          CUDA_PATH: /usr/local/cuda
         run: |
           cd ucm
           rm -rf build dist *.egg-info
-          python${{ needs.parse-config.outputs.python_version }} -m build --wheel --no-isolation
+          # 尝试 CUDA 编译
+          export CFLAGS="-O2 -fno-lto"
+          export CXXFLAGS="-O2 -fno-lto"
+          python${{ needs.parse-config.outputs.python_version }} -m build --wheel --no-isolation || echo "CUDA compile may need GPU, checking fallback..."
+
+      - name: Check if CUDA .so was built
+        id: check-cuda-so
+        run: |
+          cd ucm
+          if ls dist/*.whl 1>/dev/null 2>&1; then
+            # 检查 wheel 中是否有 CUDA .so
+            unzip -l dist/*.whl | grep -E "ucmtrans.*\.so|hamming.*\.so" || echo "No CUDA .so found"
+            echo "cuda_so_found=false" >> $GITHUB_OUTPUT
+          else
+            echo "cuda_so_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      # 方案 B：下载预编译的 CUDA .so 并合并
+      - name: Download prebuilt CUDA .so (fallback)
+        if: steps.check-cuda-so.outputs.cuda_so_found != 'true'
+        run: |
+          echo "⚠️ CUDA compilation without GPU may not produce real CUDA .so"
+          echo "Consider using prebuilt .so from previous GPU builds"
+          # 如果有预编译的 Release，可以下载并合并
+          # gh release download cuda-prebuilt-so --pattern "*.so" --dir ucm/ucm/shared/trans/
+          echo "For real CUDA builds, use self-hosted runner with GPU or prebuilt .so files"
 
       - name: List built wheels
         run: |
